@@ -7,5 +7,5 @@ JOINTLY is an algorithm to jointly cluster single cell RNA sequencing datastes u
 
 
 ### Citation
-The preprint version of this article is available at [link](https://doi.org/XXXXX)   <br/>
+The preprint version of this article is available at [BioRxiv](https://doi.org/XXXXX)   <br/>
 _Møller AF, Madsen JGS et al **Multi-task clustering of scRNA-seq datasets (2022)** Unpublished_  <br/>
