@@ -1,4 +1,4 @@
-# JOINTLY : Joint clustering of single-cell RNA sequencing datasets
+# JOINTLY : Multi-task clustering of single-cell RNA sequencing datasets
 ![Graphical Summary](figs/graphical_summary.png)
 
 JOINTLY is an algorithm to jointly cluster single cell RNA sequencing datastes using kernel based joint non-negativ matrix factorizaiton, allowing it to jointly non-linear manifolds. JOINTLY effectively captures shared cell states and while robustly accounting for dataset specific states.
