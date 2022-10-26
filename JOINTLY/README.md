@@ -1,1 +1,0 @@
-# JOINTLY
