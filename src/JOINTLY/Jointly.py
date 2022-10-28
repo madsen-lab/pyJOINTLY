@@ -12,7 +12,6 @@ import graphtools
 import ray
 from tqdm.notebook import tqdm
 from jointly.JointlyObject import JointlyObject
-#from JointlyObject import JointlyObject
 
 
 def CreateJointlyObject_from_scanpy(adata, batch_key):
@@ -34,12 +33,12 @@ def CreateJointlyObject_from_scanpyList(adata_list, batch_key = None):
     jointlyobject = JointlyObject(adata_list, batch_key = batch_key)
     for data in adata_list:
         if type(data.X) is scipy.sparse.csr.csr_matrix:   # TODO: Check this works
-            jointlyobject.X.append(data.X.todense())
+            jointlyobject.X.append(np.asarray(data.X.todense()))
         else:
             jointlyobject.X.append(data.X)
 
         #jointlyobject.adata_list.append(data)
-    jointlyobject.anndata = sc.AnnData.concatenate(*adata_list)
+    jointlyobject.anndata = sc.AnnData.concatenate(*adata_list, batch_key = 'Jointly_batch') #use specific batch key, to not overwrite potential batch information
     return jointlyobject
 def CreateJointlyObject_from_numpyList(adata_list, batch_key = None):
     """ """
@@ -51,7 +50,7 @@ def Normalize_libsize(jointlyobject, inplace = True, scalefactor = 10000):
     """Normalize to library size """
     norm = []
     for i in range(jointlyobject.n_datasets):
-        norm.append(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']])
+        norm.append(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']])
     if inplace:
         jointlyobject.norm_data =  norm
         print('Added normalized data to .norm_data')
@@ -81,7 +80,7 @@ def Scale_data(jointlyobject, inplace = True):
         scaled.append(scale.fit_transform(np.log1p(jointlyobject.norm_data[i].T)).T)
     if inplace:
         jointlyobject.scaled_data =  scaled
-        print('Added normalized data to .scaled_data')
+        print('Added scaled data to .scaled_data')
     else:
         return scaled
 
@@ -108,7 +107,7 @@ def Subset_to_HVG(jointlyobject, HVGs = None):
 
 
 def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, iter_max = 100):
-    """ """
+    """Common PCA function"""
 
     X = jointlyobject.scaled_data
     n_datasets = len(X)
@@ -273,6 +272,8 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
     for ds in range(n_datasets):
         jointlyobject.adata_list[ds].obsm['X_pca'] = C_list[ds]
+    print("Added cPCA to .adata_list.obsm['X_pca']")
+
 
 
 def make_kernel(jointlyobject, type = 'alphadecay', knn = 5, knn_max = 100, decay = 2, thresh = 1e-4, inplace = True):
@@ -384,6 +385,7 @@ def updateH(ds, data_range, rare, Fs, Ks, Hs, As, Ws, X, D_As,
 
 
 
+
 def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lambda_ = 100, beta = 1, factorization_rank = 20, cpu = 1):
 
     ray.init(num_cpus=cpu )
@@ -425,8 +427,8 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
         dataB = pd.DataFrame(jointlyobject.adata_list[ds].obsm['X_pca']) # to
 
         kdB = KDTree(dataB.values)
-        test = kdB.query(dataA.values, k=kr +1)[0]
-        rare.append(np.array(1 - (1 / test[:,-1])))
+        rare_neighbors = kdB.query(dataA.values, k=kr +1)[0]
+        rare.append(np.array(1 - (1 / rare_neighbors[:,-1])))
 
 
     for ds in range(jointlyobject.n_datasets):
@@ -459,14 +461,15 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
         Fs_id = ray.put(Fs)
 
     ray.shutdown()
-
+    Hs = [np.asarray(H) for H in Hs]
     jointlyobject.Hs = Hs
     jointlyobject.Ws = Ws
 
-    for ds in range(jointlyobject.n_datasets):
-        jointlyobject.adata_list[ds].obsm['X_Jointly'] = Hs[ds].T
-
     scale = StandardScaler()
+    for ds in range(jointlyobject.n_datasets):
+        jointlyobject.adata_list[ds].obsm['X_Jointly'] = scale.fit_transform(Hs[ds].T)
+
+
     merge_H = np.concatenate([scale.fit_transform(h.T).T for h in Hs], axis = 1)
     jointlyobject.anndata.obsm['X_Jointly'] = merge_H.T
 
@@ -475,7 +478,7 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
 
 def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, scale = True,
             cPCA_threshold = 0.80, cPCA_kc = 20, cPCA_ki = 20, cPCA_oversampling = 10, cPCA_iter_max = 100,
-            kernel_type = 'alphadecay', kernel_knn = 5, kernel_knn_max = 100, kernel_decay = 2, kernel_thresh = 1e-4,
+            kernel_type = 'alphadecay', kernel_knn = 5, kernel_knn_max = 100, kernel_decay = 1, kernel_thresh = 1e-4,
             SNN_neighbor_offset = 20,
             decomposition_iter_max = 100, decomposition_alpha = 100, decomposition_mu = 1, decomposition_lambda = 100, decomposition_beta = 1, decomposition_factorization_rank = 20,
             cpu = 1, return_adata = False):
