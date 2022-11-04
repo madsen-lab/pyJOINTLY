@@ -153,7 +153,11 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
     sc_u = sc_u[:, :k]
     sc_s = sc_s[:k]
-    sc_vh = sc_vh[:, :k]
+    sc_vh = sc_vh[:k, :].T
+    #sc_vh = sc_vh[:, :k]
+
+    jointlyobject.common_components = {'u': sc_u, 's': sc_s, 'v':sc_vh}
+
     sc_mprod = 2 * iter_ + 1
 
     var_explain = np.concatenate([np.var((np.dot(sc_u.T, X[ds].T)).T, axis = 0) / np.sum(np.var(X[ds],axis = 0)) for ds in range(n_datasets) ]).T
@@ -192,7 +196,8 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
         si_u = si_u[:, :k]
         si_s = si_s[:k]
-        si_vh = si_vh[:, :k]
+        #si_vh = si_vh[:, :k]
+        si_vh = si_vh[:k, :].T
         si_mprod = 2 * iter_ + 1
 
         #Save variances
@@ -239,7 +244,8 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
         si_u = si_u[:, :k]
         si_s = si_s[:k]
-        si_vh = si_vh[:, :k]
+        si_vh = si_vh[:k, :].T
+        #si_vh = si_vh[:, :k]
         si_mprod = 2 * iter_ + 1
 
 
@@ -254,6 +260,7 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
             si_u = si_u[:, :k_sel]
             si_s = si_s[:k_sel]
             si_vh = si_vh[:, :k_sel]
+            si_vh = si_vh[:k_sel, :].T
             S_list.append({'u':si_u,
                            's':si_s,
                            'vh':si_vh})
@@ -384,21 +391,24 @@ def updateH(ds, data_range, rare, Fs, Ks, Hs, As, Ws, X, D_As,
     return np.multiply(Hs[ds] , ((numerator1 + numerator2 + numerator3 + numerator4) / (denom1 + denom2)))
 
 
+def solve_for_F(K, H):
+    F = np.linalg.lstsq(H.T, K, rcond = None)[0].T
+    F[F < 0] = 0
+    return np.asarray(F)
 
-
-def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lambda_ = 100, beta = 1, factorization_rank = 20, cpu = 1):
+def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lambda_ = 100, beta = 1, factorization_rank = 20, cpu = 1, emph_rare=True, initilization = 'NNDSVD'):
 
     ray.init(num_cpus=cpu )
 
-    n_genes = jointlyobject.adata_list[0].shape[1]
-    n_cells = [jointlyobject.adata_list[i].shape[0] for i in range(len(jointlyobject.adata_list))]
+    n_genes = jointlyobject.norm_data[0].shape[1]#jointlyobject.adata_list[0].shape[1]
+    #n_cells = [jointlyobject.adata_list[i].shape[0] for i in range(len(jointlyobject.adata_list))]
 
     X = [x.T for x in jointlyobject.norm_data]
 
     #setting up NMF placeholders
     Fs = list()
     Hs = list()
-    Hs_new = list()
+    #Hs_new = list()
     #As = list()
     Vs = list()
     D_As = list()
@@ -413,24 +423,61 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
     rare = []
 
     for ds in range(jointlyobject.n_datasets):
-        Hs.append(np.random.rand(k, n_cells[ds]))
-        Hs_new.append(np.random.rand(k, n_cells[ds]))
-        Fs.append(np.random.rand(n_cells[ds], k))
+        if initilization == 'NNDSVD':
+
+
+            H_ = np.zeros((k, jointlyobject.n_cells[ds]))
+            W_ = np.zeros((n_genes, k))
+
+            #init_u, init_s, init_v = np.linalg.svd(jointlyobject.scaled_data[ds])
+            u_ = np.dot(jointlyobject.scaled_data[ds], jointlyobject.common_components['u'])
+            s_ = jointlyobject.common_components['s']
+            v_ = jointlyobject.common_components['v'].T
+
+
+            H_[0,:] = np.sqrt(s_[0]) * np.abs(u_[:,0])
+            W_[:,0] = np.sqrt(s_[0]) * np.abs(v_[0,:])
+
+            for i in range(1,k):
+                # Form the rank one factor
+                Tmp = np.dot(u_[:,i:i+1],v_[i:i+1,:]*s_[i])
+                # zero out the negative elements
+                Tmp = np.where(Tmp < 0, 0.0, Tmp)
+
+                u_, s_, v_ = np.linalg.svd(Tmp)
+
+                H_[i,:] = np.sqrt(s_[0]) * np.abs(u_[:,0])
+                W_[:,i] = np.sqrt(s_[0]) * np.abs(v_[0,:])
+
+            #Change
+            Hs.append(H_)
+
+            #Hs_new.append(np.zeros((k, n_cells[ds])))
+            Fs.append(solve_for_F(jointlyobject.K[ds], H_))
+            #Fs.append(np.random.rand(jointlyobject.n_cells[ds], k))
+
+        else:
+            Hs.append(np.random.rand(k, jointlyobject.n_cells[ds]))
+            #Hs_new.append(np.random.rand(k, n_cells[ds]))
+            Fs.append(np.random.rand(jointlyobject.n_cells[ds], k))
 
         #Parts of the Laplacian matrix
         Vs.append(np.sum(As[ds], axis = 0))
         D_As.append(np.diag(Vs[ds]))
 
         #rare cell
-        kr = rice(n_cells[ds])
-        dataA = pd.DataFrame(jointlyobject.adata_list[ds].obsm['X_pca']) # from
-        dataB = pd.DataFrame(jointlyobject.adata_list[ds].obsm['X_pca']) # to
+        if emph_rare:
+            kr = rice(jointlyobject.n_cells[ds])
+            dataA = pd.DataFrame(jointlyobject.adata_list[ds].obsm['X_pca']) # from
+            dataB = pd.DataFrame(jointlyobject.adata_list[ds].obsm['X_pca']) # to
 
-        kdB = KDTree(dataB.values)
-        rare_neighbors = kdB.query(dataA.values, k=kr +1)[0]
-        rare.append(np.array(1 - (1 / rare_neighbors[:,-1])))
+            kdB = KDTree(dataB.values)
+            rare_neighbors = kdB.query(dataA.values, k=kr +1)[0]
+            rare.append(np.array(1 - (1 / rare_neighbors[:,-1])))
+        else:
+            rare.append(np.ones((jointlyobject.n_cells[ds])))
 
-
+    jointlyobject.Hs_init = Hs
     for ds in range(jointlyobject.n_datasets):
 
         Ws.append(solve_for_W(X[ds], Hs[ds]))
@@ -480,7 +527,7 @@ def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, 
             cPCA_threshold = 0.80, cPCA_kc = 20, cPCA_ki = 20, cPCA_oversampling = 10, cPCA_iter_max = 100,
             kernel_type = 'alphadecay', kernel_knn = 5, kernel_knn_max = 100, kernel_decay = 1, kernel_thresh = 1e-4,
             SNN_neighbor_offset = 20,
-            decomposition_iter_max = 100, decomposition_alpha = 100, decomposition_mu = 1, decomposition_lambda = 100, decomposition_beta = 1, decomposition_factorization_rank = 20,
+            decomposition_iter_max = 100, initilization = 'NNDSVD', decomposition_alpha = 100, decomposition_mu = 1, decomposition_lambda = 100, decomposition_beta = 1, decomposition_factorization_rank = 20, decomposition_emph_rare = True,
             cpu = 1, return_adata = False):
     """
     Jointly main function
@@ -591,7 +638,7 @@ def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, 
     decomposition_params['SNN_neighbor_offset' ] = SNN_neighbor_offset
 
     #TODO: Implement checks
-    JointlyDecomposition(jointlyobject, iter_max = decomposition_iter_max, alpha = decomposition_alpha, mu = decomposition_mu, lambda_ = decomposition_lambda, beta = decomposition_beta, factorization_rank = decomposition_factorization_rank, cpu = cpu)
+    JointlyDecomposition(jointlyobject, iter_max = decomposition_iter_max, alpha = decomposition_alpha, mu = decomposition_mu, lambda_ = decomposition_lambda, beta = decomposition_beta, factorization_rank = decomposition_factorization_rank, cpu = cpu, emph_rare = decomposition_emph_rare, initilization = initilization)
     decomposition_params = decomposition_params | {'decomposition_iter_max' : decomposition_iter_max, 'decomposition_alpha' : decomposition_alpha, 'decomposition_mu' : decomposition_mu, 'decomposition_lambda' : decomposition_lambda, 'decomposition_beta' : decomposition_beta, 'decomposition_factorization_rank' : decomposition_factorization_rank}
     jointlyobject.parameters['Decomposition'] = decomposition_params
     if return_adata:
