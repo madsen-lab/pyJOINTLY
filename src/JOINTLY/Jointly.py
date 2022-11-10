@@ -46,11 +46,15 @@ def CreateJointlyObject_from_numpyList(adata_list, batch_key = None):
 
 
 
-def Normalize_libsize(jointlyobject, inplace = True, scalefactor = 10000):
+def Normalize_libsize(jointlyobject, inplace = True, scalefactor = 10000, log = False):
     """Normalize to library size """
     norm = []
     for i in range(jointlyobject.n_datasets):
-        norm.append(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']])
+        if log:
+            norm.append(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']])
+        else:
+            norm.append(np.log1p(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']]))
+
     if inplace:
         jointlyobject.norm_data =  norm
         print('Added normalized data to .norm_data')
@@ -139,11 +143,9 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
         idx = d_new > eps2
         if sum(~idx) == 0:
-            pass
-        #    break
+            break
         if max(abs((d_new[idx] - d[idx]+ eps2) / (d[idx] + eps2))) < tol:  #added eps2 for division by zero error
-            pass
-        #    break
+            break
         d = d_new
 
     Q, _ = np.linalg.qr(np.dot(V, Q))
@@ -151,12 +153,14 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
     sc_u, sc_s, sc_vh = np.linalg.svd(B)
     sc_u = np.dot(Q, sc_u)
 
+    jointlyobject.common_components = {'u': sc_u, 's': sc_s, 'v':sc_vh}
+
     sc_u = sc_u[:, :k]
     sc_s = sc_s[:k]
     sc_vh = sc_vh[:k, :].T
     #sc_vh = sc_vh[:, :k]
 
-    jointlyobject.common_components = {'u': sc_u, 's': sc_s, 'v':sc_vh}
+
 
     sc_mprod = 2 * iter_ + 1
 
@@ -182,11 +186,9 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
             idx = d_new > eps2
             if sum(~idx) == 0:
-                pass
-            #    break
+                break
             if max(abs((d_new[idx] - d[idx]+ eps2) / (d[idx] + eps2))) < tol:  #added eps2 for division by zero error
-                pass
-            #    break
+                break
             d = d_new
 
         Q, _ = np.linalg.qr(np.dot(V, Q))
@@ -230,11 +232,9 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
             idx = d_new > eps2
             if sum(~idx) == 0:
-                pass
-            #    break
+                break
             if max(abs((d_new[idx] - d[idx]+ eps2) / (d[idx] + eps2))) < tol:  #added eps2 for division by zero error
-                pass
-            #    break
+                break
             d = d_new
 
         Q, _ = np.linalg.qr(np.dot(V, Q))
@@ -396,7 +396,7 @@ def solve_for_F(K, H):
     F[F < 0] = 0
     return np.asarray(F)
 
-def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lambda_ = 100, beta = 1, factorization_rank = 20, cpu = 1, emph_rare=True, initilization = 'NNDSVD'):
+def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lambda_ = 100, beta = 1, factorization_rank = 20, cpu = 1, emph_rare=True, initilization = 'NNDSVD', eps = 1e-20, early_stopping = True):
 
     ray.init(num_cpus=cpu )
 
@@ -425,29 +425,39 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
     for ds in range(jointlyobject.n_datasets):
         if initilization == 'NNDSVD':
 
-
             H_ = np.zeros((k, jointlyobject.n_cells[ds]))
             W_ = np.zeros((n_genes, k))
 
-            #init_u, init_s, init_v = np.linalg.svd(jointlyobject.scaled_data[ds])
-            u_ = np.dot(jointlyobject.scaled_data[ds], jointlyobject.common_components['u'])
-            s_ = jointlyobject.common_components['s']
-            v_ = jointlyobject.common_components['v'].T
+            #u_ = np.dot(jointlyobject.scaled_data[ds], jointlyobject.common_components['u'])
+            #s_ = jointlyobject.common_components['s']
+            #v_ = jointlyobject.common_components['v'].T
+            ##NNDSVD algorithm from https://github.com/nils-werner/pymf/blob/master/pymf/nndsvd.py
+            u, s, v = np.linalg.svd(jointlyobject.scaled_data[ds].T)
 
+            # The first left singular vector is nonnegative
+            # (abs is only used as values could be all negative)
+            W_[:,0] = np.sqrt(s[0]) * np.abs(u[:,0])
 
-            H_[0,:] = np.sqrt(s_[0]) * np.abs(u_[:,0])
-            W_[:,0] = np.sqrt(s_[0]) * np.abs(v_[0,:])
+            #The first right singular vector is nonnegative
+            H_[0,:] = np.sqrt(s[0]) * np.abs(v[0,:].T)
 
             for i in range(1,k):
                 # Form the rank one factor
-                Tmp = np.dot(u_[:,i:i+1],v_[i:i+1,:]*s_[i])
+                Tmp = np.dot(u[:,i:i+1]*s[i], v[i:i+1,:])
+
                 # zero out the negative elements
                 Tmp = np.where(Tmp < 0, 0.0, Tmp)
 
+                # Apply 2nd SVD
                 u_, s_, v_ = np.linalg.svd(Tmp)
 
-                H_[i,:] = np.sqrt(s_[0]) * np.abs(u_[:,0])
-                W_[:,i] = np.sqrt(s_[0]) * np.abs(v_[0,:])
+                # The first left singular vector is nonnegative
+                W_[:,i] = np.sqrt(s_[0]) * np.abs(u_[:,0])
+
+                #The first right singular vector is nonnegative
+                H_[i,:] = np.sqrt(s_[0]) * np.abs(v_[0,:].T)
+
+
 
             #Change
             Hs.append(H_)
@@ -493,12 +503,22 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
     X_id= ray.put(X)
     D_As_id= ray.put(D_As)
 
-    for _ in tqdm(range(iter_max)):
+
+    iterator = tqdm(range(iter_max))
+    for _ in iterator:
         #Update H
-        Hs = ray.get([updateH.remote(ds, data_range, rare, Fs_id, Ks_id, Hs_id, As_id, Ws_id, X_id, D_As_id,
+        Hs_new = ray.get([updateH.remote(ds, data_range, rare, Fs_id, Ks_id, Hs_id, As_id, Ws_id, X_id, D_As_id,
             alpha, beta, lambda_, mu) for ds in range(jointlyobject.n_datasets)])
 
-        Hs_id = ray.put(Hs)
+
+        max_error = np.max([np.linalg.norm(Hs[ds] - Hs_new[ds]) for ds in range(jointlyobject.n_datasets)])
+        if (max_error <= eps) and early_stopping == True:
+            iterator.close()
+            break
+        Hs = Hs_new
+
+
+        Hs_id = ray.put(Hs_new)
 
         for ds in range(jointlyobject.n_datasets):
             Ws[ds] = solve_for_W(X[ds], Hs[ds])
@@ -523,11 +543,11 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
 
 
 
-def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, scale = True,
+def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, log = False, scale = True,
             cPCA_threshold = 0.80, cPCA_kc = 20, cPCA_ki = 20, cPCA_oversampling = 10, cPCA_iter_max = 100,
             kernel_type = 'alphadecay', kernel_knn = 5, kernel_knn_max = 100, kernel_decay = 1, kernel_thresh = 1e-4,
             SNN_neighbor_offset = 20,
-            decomposition_iter_max = 100, initilization = 'NNDSVD', decomposition_alpha = 100, decomposition_mu = 1, decomposition_lambda = 100, decomposition_beta = 1, decomposition_factorization_rank = 20, decomposition_emph_rare = True,
+            decomposition_iter_max = 100, initilization = 'NNDSVD', decomposition_alpha = 100, decomposition_mu = 1, decomposition_lambda = 100, decomposition_beta = 1, decomposition_factorization_rank = 20, decomposition_emph_rare = True, decomposition_early_stopping = True,
             cpu = 1, return_adata = False):
     """
     Jointly main function
@@ -610,7 +630,7 @@ def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, 
         jointlyobject.parameters['Preprocessing']['normalization'] = 'User normalizaiton'
         pass    #TODO: Implement user normalizaiton
     elif (type(normalization_factor) is int) or (type(normalization_factor) is float):
-        Normalize_libsize(jointlyobject, inplace = True, scalefactor = normalization_factor)
+        Normalize_libsize(jointlyobject, inplace = True, scalefactor = normalization_factor, log = log)
         jointlyobject.parameters['Preprocessing']['normalization'] = normalization_factor
     else:
         raise TypeError('normalization_factor must be an integer or float')
@@ -638,7 +658,7 @@ def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, 
     decomposition_params['SNN_neighbor_offset' ] = SNN_neighbor_offset
 
     #TODO: Implement checks
-    JointlyDecomposition(jointlyobject, iter_max = decomposition_iter_max, alpha = decomposition_alpha, mu = decomposition_mu, lambda_ = decomposition_lambda, beta = decomposition_beta, factorization_rank = decomposition_factorization_rank, cpu = cpu, emph_rare = decomposition_emph_rare, initilization = initilization)
+    JointlyDecomposition(jointlyobject, iter_max = decomposition_iter_max, alpha = decomposition_alpha, mu = decomposition_mu, lambda_ = decomposition_lambda, beta = decomposition_beta, factorization_rank = decomposition_factorization_rank, cpu = cpu, emph_rare = decomposition_emph_rare, initilization = initilization, early_stopping = decomposition_early_stopping)
     decomposition_params = decomposition_params | {'decomposition_iter_max' : decomposition_iter_max, 'decomposition_alpha' : decomposition_alpha, 'decomposition_mu' : decomposition_mu, 'decomposition_lambda' : decomposition_lambda, 'decomposition_beta' : decomposition_beta, 'decomposition_factorization_rank' : decomposition_factorization_rank}
     jointlyobject.parameters['Decomposition'] = decomposition_params
     if return_adata:
