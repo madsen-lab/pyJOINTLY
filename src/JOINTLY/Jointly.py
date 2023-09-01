@@ -3,7 +3,7 @@ from math import floor
 import numpy as np
 import pandas as pd
 import scipy
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.decomposition import PCA
 from scipy.spatial import distance_matrix
 from scipy.spatial import KDTree
@@ -12,82 +12,48 @@ import graphtools
 import ray
 from tqdm.notebook import tqdm
 from jointly.JointlyObject import JointlyObject
+from fcmeans import FCM
+
+from sklearn.neighbors import NearestNeighbors
+from scipy.sparse import csr_matrix
+
+import kneed
 
 
+
+## Preprocess
 def CreateJointlyObject_from_scanpy(adata, batch_key):
     """ """
     adata_list = []
     for batch in adata.obs[batch_key].unique():
         adata_list.append(adata[adata.obs[batch_key] == batch].copy())
-    jointlyobject = JointlyObject(adata_list, batch_key = batch_key)
-    for data in adata_list:
-        if type(data.X) is scipy.sparse.csr.csr_matrix:   # TODO: Check this works
-            jointlyobject.X.append(data.X.todense())
-        else:
-            jointlyobject.X.append(data.X)
 
+    jointlyobject = JointlyObject(adata_list, batch_key = batch_key)
+    for idx in range(len(adata_list)):
+        if type(jointlyobject.adata_list[idx].X) is scipy.sparse.csr.csr_matrix:  #Check if matrix is sparse
+            jointlyobject.adata_list[idx].X = np.asarray(jointlyobject.adata_list[idx].X .todense()) #Overwrite with dense array
+        jointlyobject.X.append(jointlyobject.adata_list[idx].X)
     jointlyobject.anndata = adata
+    jointlyobject.anndata.obs['Jointly_batch'] = jointlyobject.anndata.obs[batch_key]
     return jointlyobject
+
 def CreateJointlyObject_from_scanpyList(adata_list, batch_key = None):
     """ """
     jointlyobject = JointlyObject(adata_list, batch_key = batch_key)
-    for data in adata_list:
-        if type(data.X) is scipy.sparse.csr.csr_matrix:   # TODO: Check this works
-            jointlyobject.X.append(np.asarray(data.X.todense()))
-        else:
-            jointlyobject.X.append(data.X)
+    for idx in range(len(adata_list)):
+        if type(jointlyobject.adata_list[idx].X) is scipy.sparse.csr.csr_matrix:  #Check if matrix is sparse
+            jointlyobject.adata_list[idx].X = np.asarray(jointlyobject.adata_list[idx].X .todense()) # overwrite with dense array
+        jointlyobject.X.append(jointlyobject.adata_list[idx].X)
 
-        #jointlyobject.adata_list.append(data)
     jointlyobject.anndata = sc.AnnData.concatenate(*adata_list, batch_key = 'Jointly_batch') #use specific batch key, to not overwrite potential batch information
     return jointlyobject
-def CreateJointlyObject_from_numpyList(adata_list, batch_key = None):
-    """ """
-    pass #TODO: Finish method
+
+
+## make method for numpy arrays
 
 
 
-def Normalize_libsize(jointlyobject, inplace = True, scalefactor = 10000, log = False):
-    """Normalize to library size """
-    norm = []
-    for i in range(jointlyobject.n_datasets):
-        if log:
-            norm.append(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']])
-        else:
-            norm.append(np.log1p(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']]))
-
-    if inplace:
-        jointlyobject.norm_data =  norm
-        print('Added normalized data to .norm_data')
-    else:
-        return norm
-
-def Scale_pearson_residuals(jointlyobject, inplace = True):
-    """Normalize to pearson residuals. Can only be used as scaled data for cPCA but not for decomposition"""
-    #https://scanpy-tutorials.readthedocs.io/en/latest/tutorial_pearson_residuals.html
-    norm = []
-    for i in range(jointlyobject.n_datasets):
-        tmp = jointlyobject.adata_list[i].copy()
-        sc.experimental.pp.normalize_pearson_residuals(tmp)
-        norm.append(tmp.X[:,tmp.var['highly_variable']])
-    if inplace:
-        jointlyobject.scaled_data =  norm
-        print('Added normalized data to .scaled_data')
-    else:
-        return norm
-
-
-def Scale_data(jointlyobject, inplace = True):
-    """Z-score genes and subset to HVGs """
-    scaled = []
-    scale = StandardScaler()
-    for i in range(jointlyobject.n_datasets):
-        scaled.append(scale.fit_transform(np.log1p(jointlyobject.norm_data[i].T)).T)
-    if inplace:
-        jointlyobject.scaled_data =  scaled
-        print('Added scaled data to .scaled_data')
-    else:
-        return scaled
-
+## CPCA
 def Feature_selection(jointlyobject, n_hvg_features = 1000):
     """Feature selection using pearson residuals approximation"""
     for ds in range(len(jointlyobject.adata_list)):
@@ -95,8 +61,6 @@ def Feature_selection(jointlyobject, n_hvg_features = 1000):
             jointlyobject.adata_list[ds], flavor="pearson_residuals", n_top_genes=n_hvg_features)
     Subset_to_HVG(jointlyobject)
     print("Added highly variable genes to .adata_list.var['highly_variable']")
-
-
 
 def Subset_to_HVG(jointlyobject, HVGs = None):
     """ """
@@ -107,8 +71,38 @@ def Subset_to_HVG(jointlyobject, HVGs = None):
     hvg = hvg.dropna()
     hvgs = hvg.sum(axis = 1) > 0
     for ds in range(jointlyobject.n_datasets):
-        jointlyobject.adata_list[ds].var.highly_variable = [x in hvgs[hvgs == True].index for x in jointlyobject.adata_list[ds].var.index] #can probably be much faster
+        jointlyobject.adata_list[ds].var.highly_variable = [x in hvgs[hvgs == True].index for x in jointlyobject.adata_list[ds].var.index]
 
+def Normalize_libsize(jointlyobject, inplace = True, scalefactor = 10000, log = True):
+    """Normalize to library size and subset to HVGs"""
+    norm = []
+    for i in range(jointlyobject.n_datasets):
+        sf = jointlyobject.X[i].sum(axis = 1)[:,None] / scalefactor
+        if log:
+            norm.append(np.log1p((jointlyobject.X[i] / sf)[:,jointlyobject.adata_list[i].var['highly_variable']]))
+            #norm.append(np.log1p(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']]))
+        else:
+            norm.append((jointlyobject.X[i] / sf)[:,jointlyobject.adata_list[i].var['highly_variable']])
+            #norm.append(((jointlyobject.X[i] / jointlyobject.X[i].sum(axis = 1)[:,None]) * scalefactor)[:,jointlyobject.adata_list[i].var['highly_variable']])
+
+
+    if inplace:
+        jointlyobject.norm_data =  norm
+        print('Added normalized data to .norm_data')
+    else:
+        return norm
+
+def Scale_data(jointlyobject, inplace = True):
+    """Z-score genes and subset to HVGs """
+    scaled = []
+    scale = StandardScaler()
+    for i in range(jointlyobject.n_datasets):
+        scaled.append(scale.fit_transform(jointlyobject.norm_data[i].T).T)
+    if inplace:
+        jointlyobject.scaled_data =  scaled
+        print('Added scaled data to .scaled_data')
+    else:
+        return scaled
 
 def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, iter_max = 100):
     """Common PCA function"""
@@ -283,7 +277,10 @@ def cPCA(jointlyobject, threshold = 0.80, kc = 20, ki = 20, oversampling = 10, i
 
 
 
-def make_kernel(jointlyobject, type = 'alphadecay', knn = 5, knn_max = 100, decay = 2, thresh = 1e-4, inplace = True):
+
+
+
+def make_kernel(jointlyobject, type = 'alphadecay', knn = 5, knn_max = 100, decay = 5, thresh = 1e-4, inplace = True):
     """ """
     K = []
     if type == 'alphadecay':
@@ -330,28 +327,51 @@ def sharedNearest(count,k):
         for j in range(nextIndex,count):
             if j in similarityMatrix[i] and i in similarityMatrix[j]:
                 count1=countIntersection(similarityMatrix[i],similarityMatrix[j])
-                Snngraph[i][j]=count1
-                Snngraph[j][i]=count1
+                count2 = count1 / k + k - count1
+                Snngraph[i][j]=count2
+                Snngraph[j][i]=count2
     return Snngraph
 
 
 @ray.remote
-def SNN(pcs, k):
-    n_cells = pcs.shape[0]
+def SNN(pcs, k, prune = 1/15):
 
-    dists = distance_matrix(pcs, pcs)
-    distanceMatrix=[[[(j,i), dists[j,i]] for i in range(n_cells)] for j in range(n_cells)]
+    neigh = NearestNeighbors(n_neighbors=k, radius=0, algorithm='kd_tree')
+    neigh.fit(pcs)
+    knn = neigh.kneighbors(pcs, n_neighbors=k, return_distance=False)
+    knn = knn.astype(np.int)
 
-    similarityMatrix=findKNNList(distanceMatrix,k)
-    sharedNearestN= sharedNearest(n_cells,k)
-    sharedNearestN = np.array(sharedNearestN)
-    return sharedNearestN
+    num_cells = knn.shape[0]
+    rows = np.repeat(list(range(num_cells)), k)
+    columns = knn.flatten()
+    data = np.repeat(1, num_cells * k)
+    snn = csr_matrix((data, (rows, columns)), shape=(num_cells, num_cells))
+
+    snn = snn @ snn.transpose()
+
+    rows, columns = snn.nonzero()
+    data = snn.data / (k + (k - snn.data))
+    data[data < prune] = 0
+
+    return np.array(csr_matrix((data, (rows, columns)), shape=(num_cells, num_cells)).todense())
+
+    #n_cells = pcs.shape[0]
+
+    #dists = distance_matrix(pcs, pcs)
+    #distanceMatrix=[[[(j,i), dists[j,i]] for i in range(n_cells)] for j in range(n_cells)]
+
+    #similarityMatrix=findKNNList(distanceMatrix,k)
+    #sharedNearestN= sharedNearest(n_cells,k)
+    #sharedNearestN = np.array(sharedNearestN)
+    #sharedNearestN[sharedNearestN < prune] = 0
+    #return sharedNearestN
 
 
 def Make_SNN(jointlyobject, neighbor_offset = 20, inplace = True, cpu = 1):
     """ """
     ray.init(num_cpus=cpu )
-    SNNs = ray.get([SNN.remote(jointlyobject.adata_list[ds].obsm['X_pca'], rice(jointlyobject.n_cells[ds]) + neighbor_offset) for ds in range(jointlyobject.n_datasets)])
+    SNNs = ray.get([SNN.remote(jointlyobject.adata_list[ds].obsm['X_pca'], #rice(jointlyobject.n_cells[ds]) +
+                               neighbor_offset) for ds in range(jointlyobject.n_datasets)])
 
     ray.shutdown()
 
@@ -365,7 +385,14 @@ def Make_SNN(jointlyobject, neighbor_offset = 20, inplace = True, cpu = 1):
 def solve_for_W(X, H):
     W = np.linalg.lstsq(H.T, X.T, rcond = None)[0].T
     W[W < 0] = 0
-    return W
+    W = np.nan_to_num(W)
+    return np.asarray(W)
+
+def solve_for_F(K, H):
+    F = np.linalg.lstsq(H.T, K, rcond = None)[0].T
+    F[F < 0] = 0
+    F = np.nan_to_num(F)
+    return np.asarray(F)
 
 
 def rice(n):
@@ -377,33 +404,35 @@ def updateH(ds, data_range, rare, Fs, Ks, Hs, As, Ws, X, D_As,
     js = list(data_range)
     js.remove(ds)
 
-    numerator1 = np.multiply(rare[ds]*alpha,np.dot(Fs[ds].T, Ks[ds]))
+    numerator1 = np.multiply(np.dot(Fs[ds].T, Ks[ds]), rare[ds]*alpha)
     numerator2 = 2 * mu * Hs[ds]
     numerator3 = lambda_ * np.dot(Hs[ds], As[ds])
     numerator4 = sum([sum([beta  * np.linalg.multi_dot([Ws[j].T, X[ds]]),
-                                       beta  * np.linalg.multi_dot([Ws[ds].T, Ws[ds], Hs[ds]])])
+                           beta  * np.linalg.multi_dot([Ws[ds].T, Ws[ds], Hs[ds]])])
                                   for j in js])
-    denom1 = np.multiply(rare[ds]*alpha , np.linalg.multi_dot([Fs[ds].T, Ks[ds], Fs[ds], Hs[ds]])) + 2*mu*np.linalg.multi_dot([Hs[ds], Hs[ds].T, Hs[ds]]) + lambda_* np.dot(Hs[ds], D_As[ds])
-    denom2 = sum([sum([beta * np.linalg.multi_dot([Ws[j].T, Ws[j], Hs[ds]]),
-                                   2*beta * np.linalg.multi_dot([Ws[ds].T, Ws[j], Hs[ds]]),
-                                   beta *  np.linalg.multi_dot([Ws[ds].T, X[ds]])])
+
+    denom1 = np.multiply(np.linalg.multi_dot([Fs[ds].T, Ks[ds], Fs[ds], Hs[ds]]), rare[ds]*alpha)
+
+    denom2 = 2 * mu * np.linalg.multi_dot([Hs[ds], Hs[ds].T, Hs[ds]])
+    denom3 = lambda_ * np.dot(Hs[ds], D_As[ds])
+    denom4 = sum([sum([beta * np.linalg.multi_dot([Ws[j].T, Ws[j], Hs[ds]]),
+                       2 * beta * np.linalg.multi_dot([Ws[ds].T, Ws[j], Hs[ds]]),
+                       beta *  np.linalg.multi_dot([Ws[ds].T, X[ds]])])
                                           for j in js])
-    return np.multiply(Hs[ds] , ((numerator1 + numerator2 + numerator3 + numerator4) / (denom1 + denom2)))
+    return np.multiply(Hs[ds] , ((numerator1 + numerator2 + numerator3 + numerator4) / (denom1 + denom2 + denom3 + denom4)))
 
 
-def solve_for_F(K, H):
-    F = np.linalg.lstsq(H.T, K, rcond = None)[0].T
-    F[F < 0] = 0
-    return np.asarray(F)
 
-def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lambda_ = 100, beta = 1, factorization_rank = 20, cpu = 1, emph_rare=True, initilization = 'NNDSVD', eps = 1e-20, early_stopping = True):
+
+def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lambda_ = 100, beta = 1, factorization_rank = 20, cpu = 1, emph_rare=True, initilization = 'NNDSVD', eps = 1e-20, early_stopping = True, cmeans_m = 5, scale_mode = 'standard_cells'):
 
     ray.init(num_cpus=cpu )
 
     n_genes = jointlyobject.norm_data[0].shape[1]#jointlyobject.adata_list[0].shape[1]
     #n_cells = [jointlyobject.adata_list[i].shape[0] for i in range(len(jointlyobject.adata_list))]
 
-    X = [x.T for x in jointlyobject.norm_data]
+    scaler = MinMaxScaler()
+    X = [scaler.fit_transform(x).T for x in jointlyobject.norm_data]
 
     #setting up NMF placeholders
     Fs = list()
@@ -421,55 +450,38 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
     k = factorization_rank   # Replace all the way through
 
     rare = []
+    #Clustering of all cPCAs at once
+    #my_model = FCM(n_clusters=k)
+    #my_model.fit(np.concatenate([jointlyobject.adata_list[i].obsm['X_pca'] for i in range(jointlyobject.n_datasets)]))
+    #jointlyobject.anndata.obsm['F_clust'] = my_model.u
+    #c_list = []
+    #for i in jointlyobject.anndata.obs['Jointly_batch'].unique():
+    #    c_list.append(jointlyobject.anndata[jointlyobject.anndata.obs['Jointly_batch'] == i].obsm['F_clust'])
+
 
     for ds in range(jointlyobject.n_datasets):
-        if initilization == 'NNDSVD':
 
-            H_ = np.zeros((k, jointlyobject.n_cells[ds]))
-            W_ = np.zeros((n_genes, k))
+        if initilization == 'Clustering':
+            #Clustering of all cPCAs at once
+            #H_ = c_list[ds].T
+            #Hs.append(c_list[ds].T)
+            #Fs.append(solve_for_F(jointlyobject.K[ds], H_))
 
-            #u_ = np.dot(jointlyobject.scaled_data[ds], jointlyobject.common_components['u'])
-            #s_ = jointlyobject.common_components['s']
-            #v_ = jointlyobject.common_components['v'].T
-            ##NNDSVD algorithm from https://github.com/nils-werner/pymf/blob/master/pymf/nndsvd.py
-            u, s, v = np.linalg.svd(jointlyobject.scaled_data[ds].T)
-
-            # The first left singular vector is nonnegative
-            # (abs is only used as values could be all negative)
-            W_[:,0] = np.sqrt(s[0]) * np.abs(u[:,0])
-
-            #The first right singular vector is nonnegative
-            H_[0,:] = np.sqrt(s[0]) * np.abs(v[0,:].T)
-
-            for i in range(1,k):
-                # Form the rank one factor
-                Tmp = np.dot(u[:,i:i+1]*s[i], v[i:i+1,:])
-
-                # zero out the negative elements
-                Tmp = np.where(Tmp < 0, 0.0, Tmp)
-
-                # Apply 2nd SVD
-                u_, s_, v_ = np.linalg.svd(Tmp)
-
-                # The first left singular vector is nonnegative
-                W_[:,i] = np.sqrt(s_[0]) * np.abs(u_[:,0])
-
-                #The first right singular vector is nonnegative
-                H_[i,:] = np.sqrt(s_[0]) * np.abs(v_[0,:].T)
-
-
-
-            #Change
+            #Individual lustering per dataset
+            my_model = FCM(n_clusters=k, m = cmeans_m)
+            my_model.fit(jointlyobject.adata_list[ds].obsm['X_pca'])
+            H_ = my_model.u.T
+            #initialize H
             Hs.append(H_)
-
-            #Hs_new.append(np.zeros((k, n_cells[ds])))
+            #initialize F
             Fs.append(solve_for_F(jointlyobject.K[ds], H_))
-            #Fs.append(np.random.rand(jointlyobject.n_cells[ds], k))
+
 
         else:
-            Hs.append(np.random.rand(k, jointlyobject.n_cells[ds]))
-            #Hs_new.append(np.random.rand(k, n_cells[ds]))
-            Fs.append(np.random.rand(jointlyobject.n_cells[ds], k))
+            #initialize H
+            Hs.append(np.random.random_sample((k, jointlyobject.n_cells[ds])))
+            #initialize F
+            Fs.append(np.random.random_sample((jointlyobject.n_cells[ds], k)))
 
         #Parts of the Laplacian matrix
         Vs.append(np.sum(As[ds], axis = 0))
@@ -487,9 +499,11 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
         else:
             rare.append(np.ones((jointlyobject.n_cells[ds])))
 
+    #Save the initializaiton
     jointlyobject.Hs_init = Hs
-    for ds in range(jointlyobject.n_datasets):
 
+    #initialize W
+    for ds in range(jointlyobject.n_datasets):
         Ws.append(solve_for_W(X[ds], Hs[ds]))
 
     data_range = range(jointlyobject.n_datasets)
@@ -503,51 +517,106 @@ def JointlyDecomposition(jointlyobject, iter_max = 100, alpha = 100, mu = 1, lam
     X_id= ray.put(X)
     D_As_id= ray.put(D_As)
 
-
+    stop = False
     iterator = tqdm(range(iter_max))
     for _ in iterator:
         #Update H
         Hs_new = ray.get([updateH.remote(ds, data_range, rare, Fs_id, Ks_id, Hs_id, As_id, Ws_id, X_id, D_As_id,
             alpha, beta, lambda_, mu) for ds in range(jointlyobject.n_datasets)])
 
+        Hs_new = [np.nan_to_num(x) for x in Hs_new]
 
+        #Does not include most rescent score (stops before saving the updates)
         max_error = np.max([np.linalg.norm(Hs[ds] - Hs_new[ds]) for ds in range(jointlyobject.n_datasets)])
         if (max_error <= eps) and early_stopping == True:
-            iterator.close()
-            break
+            stop = True
+
         Hs = Hs_new
 
 
-        Hs_id = ray.put(Hs_new)
+        Hs_id = ray.put(Hs)
 
         for ds in range(jointlyobject.n_datasets):
+            #Update W
             Ws[ds] = solve_for_W(X[ds], Hs[ds])
             # Update F
             Fs[ds] = np.multiply(Fs[ds] , (np.dot(Ks[ds], Hs[ds].T) / np.linalg.multi_dot([Ks[ds], Fs[ds], Hs[ds], Hs[ds].T])))
         Ws_id = ray.put(Ws)
         Fs_id = ray.put(Fs)
 
+        if stop == True:
+            iterator.close()
+            break
+
     ray.shutdown()
     Hs = [np.asarray(H) for H in Hs]
+    Fs = [np.asarray(F) for F in Fs]
     jointlyobject.Hs = Hs
+    jointlyobject.Fs = Fs
     jointlyobject.Ws = Ws
 
     scale = StandardScaler()
     for ds in range(jointlyobject.n_datasets):
-        jointlyobject.adata_list[ds].obsm['X_Jointly'] = scale.fit_transform(Hs[ds].T)
+        jointlyobject.adata_list[ds].obsm['X_Jointly'] = scale.fit_transform(scale.fit_transform(Hs[ds]).T)
+        #scale_H(Hs[ds], mode = scale_mode)
 
 
-    merge_H = np.concatenate([scale.fit_transform(h.T).T for h in Hs], axis = 1)
-    jointlyobject.anndata.obsm['X_Jointly'] = merge_H.T
+    #merge_H = np.concatenate([scale_H(h, mode = scale_mode).T for h in Hs], axis = 1)
+    #Scale all Hs together
+    merge_H = np.concatenate([h for h in Hs], axis = 1)
+    scale = StandardScaler()
+    merge_H = scale.fit_transform(scale.fit_transform(merge_H).T)
+    jointlyobject.anndata.obsm['X_Jointly'] = merge_H
 
 
+
+def scale_H(H, mode = 'standard_cells'):
+    if mode == 'standard_cells':
+        scale = StandardScaler()
+        return scale.fit_transform(H).T
+    if mode == 'standard_features':
+        scale = StandardScaler()
+        return scale.fit_transform(H.T)
+    if mode == 'standard_double':
+        scale = StandardScaler()
+        return scale.fit_transform(scale.fit_transform(H.T).T).T
+    if mode == 'standard_double_r':
+        scale = StandardScaler()
+        return scale.fit_transform(scale.fit_transform(H).T)
+    if mode == 'minmax_cells':
+        scale = MinMaxScaler()
+        return scale.fit_transform(H).T
+    if mode == 'minmax_features':
+        scale = MinMaxScaler()
+        return scale.fit_transform(H.T)
+    if mode == 'minmax_double':
+        scale = MinMaxScaler()
+        return scale.fit_transform(scale.fit_transform(H.T).T).T
+    if mode == 'minmax_double_r':
+        scale = MinMaxScaler()
+        return scale.fit_transform(scale.fit_transform(H).T)
+
+def GetModules(jointlyobject):
+    scale = StandardScaler()
+    ws = jointlyobject.Ws
+    ws = [scale.fit_transform(scale.fit_transform(w.T).T) for w in ws]
+    ws_sum = sum(ws) / len(ws)
+
+    w = scale.fit_transform(scale.fit_transform(ws_sum.T).T)
+    W = pd.DataFrame(w, index = jointlyobject.adata_list[1].var[jointlyobject.adata_list[1].var['highly_variable'] == True].index)
+    modules = dict()
+    for f in  W.columns:
+        kneedle = kneed.KneeLocator(range(len(test.index)), W[f].sort_values(ascending = False),
+                          S=2.0, curve="convex", direction="decreasing")
+        modules[f] = list(W[f].sort_values(ascending = False)[:kneedle.knee].index)
+    return modules
 
 
 def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, log = False, scale = True,
             cPCA_threshold = 0.80, cPCA_kc = 20, cPCA_ki = 20, cPCA_oversampling = 10, cPCA_iter_max = 100,
             kernel_type = 'alphadecay', kernel_knn = 5, kernel_knn_max = 100, kernel_decay = 1, kernel_thresh = 1e-4,
             SNN_neighbor_offset = 20,
-            decomposition_iter_max = 100, initilization = 'NNDSVD', decomposition_alpha = 100, decomposition_mu = 1, decomposition_lambda = 100, decomposition_beta = 1, decomposition_factorization_rank = 20, decomposition_emph_rare = True, decomposition_early_stopping = True,
+            decomposition_iter_max = 100, initilization = 'NNDSVD', decomposition_alpha = 100, decomposition_mu = 1, decomposition_lambda = 100, decomposition_beta = 1, decomposition_factorization_rank = 20, decomposition_emph_rare = True, decomposition_early_stopping = True,cmeans_m = 2,scale_mode = 'standard_cells',
             cpu = 1, return_adata = False):
     """
     Jointly main function
@@ -557,9 +626,8 @@ def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, 
     Attributes:
         jointlyobject (JointlyObject):
             JointlyObject constructed with:
-                CreateJointlyObject_from_scanpy,
-                CreateJointlyObject_from_scanpyList or
-                CreateJointlyObject_from_numpyList
+                CreateJointlyObject_from_scanpy or
+                CreateJointlyObject_from_scanpyList
         n_hvg_features (int):
             Number of highly variable genes to select for per dataset pearson residuals.
             HVGs are overlapped over datasets only using genes expressed in all datsets.
@@ -658,7 +726,7 @@ def jointly(jointlyobject, n_hvg_features = 1000, normalization_factor = 10000, 
     decomposition_params['SNN_neighbor_offset' ] = SNN_neighbor_offset
 
     #TODO: Implement checks
-    JointlyDecomposition(jointlyobject, iter_max = decomposition_iter_max, alpha = decomposition_alpha, mu = decomposition_mu, lambda_ = decomposition_lambda, beta = decomposition_beta, factorization_rank = decomposition_factorization_rank, cpu = cpu, emph_rare = decomposition_emph_rare, initilization = initilization, early_stopping = decomposition_early_stopping)
+    JointlyDecomposition(jointlyobject, iter_max = decomposition_iter_max, alpha = decomposition_alpha, mu = decomposition_mu, lambda_ = decomposition_lambda, beta = decomposition_beta, factorization_rank = decomposition_factorization_rank, cpu = cpu, emph_rare = decomposition_emph_rare, initilization = initilization, early_stopping = decomposition_early_stopping,cmeans_m = cmeans_m, scale_mode = scale_mode)
     decomposition_params = decomposition_params | {'decomposition_iter_max' : decomposition_iter_max, 'decomposition_alpha' : decomposition_alpha, 'decomposition_mu' : decomposition_mu, 'decomposition_lambda' : decomposition_lambda, 'decomposition_beta' : decomposition_beta, 'decomposition_factorization_rank' : decomposition_factorization_rank}
     jointlyobject.parameters['Decomposition'] = decomposition_params
     if return_adata:
