@@ -41,9 +41,6 @@ class JointlyObject:
         return reply
 
 
-    def ExportParams(self):
-        pass
-
 
     def ComputeEmbedding(self):
         """Make a joint embedding of the merged dataset"""
