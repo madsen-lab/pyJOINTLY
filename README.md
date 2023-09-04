@@ -10,7 +10,7 @@ For the white adipose tissue atlas (WATLAS), the model weights are availiable [h
 
 # Installation
 
-JOINTLY can be installed directly from GitHub or using pip. 
+JOINTLY can be installed directly from GitHub. 
 
 ```{bash}
 pip install git+https://github.com/madsen-lab/pyJOINTLY
